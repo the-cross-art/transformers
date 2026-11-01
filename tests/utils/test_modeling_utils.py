@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import copy
+import gc
 import glob
 import json
 import os
@@ -26,6 +27,7 @@ import unittest
 import unittest.mock as mock
 import uuid
 import warnings
+import weakref
 from pathlib import Path
 from unittest.mock import patch
 
@@ -3610,10 +3612,28 @@ class TestAttentionImplementation(unittest.TestCase):
         model.config._attn_implementation = "not_a_backend"
         self.assertEqual(model.encoder.config._attn_implementation, "eager")
 
-        # The back-reference must never reach config.json.
+        # `None` means "resolve later": mirroring it would store the resolved backend on the
+        # copies while the config itself keeps `None`.
+        model = build("eager")
+        model.config._attn_implementation = None
+        self.assertIsNone(model.config._attn_implementation)
+        self.assertEqual(model.encoder.config._attn_implementation, "eager")
+
+        # The back-reference must never reach config.json, and must survive a round-trip.
+        model = build("sdpa")
         self.assertNotIn("_attn_implementation_owners", model.config.to_json_string())
         with tempfile.TemporaryDirectory() as tmp_dir:
             model.save_pretrained(tmp_dir)
+            reloaded = T5ForConditionalGeneration.from_pretrained(tmp_dir)
+        self.assertEqual(reloaded.config._attn_implementation, "sdpa")
+        self.assertEqual(reloaded.encoder.config._attn_implementation, "sdpa")
+
+        # The back-reference is weak, so it must not keep the model alive.
+        model = build("eager")
+        ref = weakref.ref(model)
+        del model
+        gc.collect()
+        self.assertIsNone(ref())
 
 
 @require_torch

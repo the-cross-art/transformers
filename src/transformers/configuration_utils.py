@@ -625,8 +625,10 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin, Heterogeneous
         # `sub_configs` does not cover stacks a model built from this config with `copy.deepcopy`
         # (the T5 family, pegasus, pop2piano, ...). Models register themselves here so the
         # assignment can reach those copies too; see `_mirror_attn_implementation_to_copied_stacks`.
+        # `None` means "resolve later"; mirroring it would store the resolved backend on the
+        # copies while this config keeps `None`, so leave the copies as they were.
         owners = self.__dict__.get("_attn_implementation_owners")
-        if owners and not isinstance(attn_implementation, dict):
+        if owners and attn_implementation is not None and not isinstance(attn_implementation, dict):
             for model in list(owners):
                 # A deepcopy of this config inherits the set; only the config a model actually
                 # holds may drive that model.

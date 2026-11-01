@@ -1730,10 +1730,6 @@ class PreTrainedModel(
                 Whether to load kernels from unverified hub repos, if `attn_implementation` is a custom kernel outside
                 of the `kernels-community` hub repository.
 
-        Prefer this over assigning `model.config._attn_implementation` directly: this walks the actual
-        submodules, so it also covers inner stacks built from `copy.deepcopy(config)`, which the config
-        setter cannot reach.
-
         Returns:
             `str`: The final attention implementation to use, including potential fallbacks from sdpa to eager, or from
             None to sdpa (to potentially eager).
@@ -2013,9 +2009,9 @@ class PreTrainedModel(
                 Whether to load kernels from unverified hub repos, if `attn_implementation` is a custom kernel outside
                 of the `kernels-community` hub repository.
 
-        Prefer this over assigning `model.config._attn_implementation` directly: this walks the
-        actual submodules, so it also covers inner stacks built from `copy.deepcopy(config)`,
-        which the config setter cannot reach.
+        Assigning `model.config._attn_implementation` reaches the same stacks, but silently keeps
+        the current value for a submodel that cannot take the requested one, because assigning on a
+        config has never raised. Prefer this method, which reports that case instead.
         """
         requested_implementation = (
             attn_implementation
