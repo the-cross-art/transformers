@@ -594,7 +594,19 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin, Heterogeneous
 
     @_attn_implementation.setter
     def _attn_implementation(self, value: str | dict | None):
-        """We set it recursively on the sub-configs as well"""
+        """Set it on this config, recursively on its declared `sub_configs`, and on the stacks any
+        model built from it holds.
+
+        A few models build their inner stacks from `copy.deepcopy(config)` (the T5 family,
+        `pegasus`, `pop2piano`, ...). Those copies are separate objects and are not declared
+        `sub_configs`, yet attention reads the implementation from the config of the stack it
+        belongs to. Models therefore register themselves on the config they are given, so this
+        setter can reach those copies instead of leaving them on the previous backend.
+
+        Reaching the copies is best effort, because assigning on a config has never raised: if a
+        submodel cannot take the value, its copies keep their current one. Prefer
+        `PreTrainedModel.set_attn_implementation`, which reports that case instead of ignoring it.
+        """
         # Set if for current config
         current_attn = getattr(self, "_attn_implementation", None)
         attn_implementation = value if not isinstance(value, dict) else value.get("", current_attn)
@@ -609,6 +621,17 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin, Heterogeneous
                     value if not isinstance(value, dict) else value.get(subconfig_key, current_subconfig_attn)
                 )
                 subconfig._attn_implementation = sub_implementation
+
+        # `sub_configs` does not cover stacks a model built from this config with `copy.deepcopy`
+        # (the T5 family, pegasus, pop2piano, ...). Models register themselves here so the
+        # assignment can reach those copies too; see `_mirror_attn_implementation_to_copied_stacks`.
+        owners = self.__dict__.get("_attn_implementation_owners")
+        if owners and not isinstance(attn_implementation, dict):
+            for model in list(owners):
+                # A deepcopy of this config inherits the set; only the config a model actually
+                # holds may drive that model.
+                if model.config is self:
+                    model._mirror_attn_implementation_to_copied_stacks(attn_implementation)
 
     @property
     def _experts_implementation(self):
@@ -1417,6 +1440,7 @@ class PreTrainedConfig(PushToHubMixin, RotaryEmbeddingConfigMixin, Heterogeneous
             "_auto_class",
             "_commit_hash",
             "_attn_implementation_internal",
+            "_attn_implementation_owners",
             "_experts_implementation_internal",
             "_post_init_done",
             "ignore_keys_at_rope_validation",

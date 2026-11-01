@@ -21,6 +21,7 @@ import os
 import re
 import sys
 import warnings
+import weakref
 from abc import abstractmethod
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterator
@@ -1266,6 +1267,10 @@ class PreTrainedModel(
         self.config._experts_implementation_internal = self._check_and_adjust_experts_implementation(
             self.config._experts_implementation
         )
+        # Let `config._attn_implementation = ...` reach stacks this model built with
+        # `copy.deepcopy(config)`: those copies are not declared `sub_configs`, so the config
+        # setter cannot find them on its own. Weak, so it never keeps a model alive.
+        self.config.__dict__.setdefault("_attn_implementation_owners", weakref.WeakSet()).add(self)
         if self.can_generate():
             # `from_model_config` is a legacy behavior -- we shouldn't set generation flags in the model config
             try:
@@ -1725,6 +1730,10 @@ class PreTrainedModel(
                 Whether to load kernels from unverified hub repos, if `attn_implementation` is a custom kernel outside
                 of the `kernels-community` hub repository.
 
+        Prefer this over assigning `model.config._attn_implementation` directly: this walks the actual
+        submodules, so it also covers inner stacks built from `copy.deepcopy(config)`, which the config
+        setter cannot reach.
+
         Returns:
             `str`: The final attention implementation to use, including potential fallbacks from sdpa to eager, or from
             None to sdpa (to potentially eager).
@@ -1956,6 +1965,39 @@ class PreTrainedModel(
         cls._can_set_experts_implementation_cached_value = can_set
         return can_set
 
+    def _mirror_attn_implementation_to_copied_stacks(self, implementation: str) -> None:
+        """Mirror `implementation` onto submodel configs that `config.sub_configs` does not reach.
+
+        Called by the `PreTrainedConfig._attn_implementation` setter. Assigning on a config has never
+        raised, so this is best effort: it resolves every target first and writes nothing unless all
+        of them accept the value.
+        """
+        # Configs the setter already walked, so we do not overwrite a per-sub-config value.
+        already_handled = {id(self.config)}
+        subconfigs = deque([self.config])
+        while subconfigs:
+            config = subconfigs.popleft()
+            for subconfig_key in config.sub_configs:
+                if (subconfig := getattr(config, subconfig_key, None)) is not None:
+                    already_handled.add(id(subconfig))
+                    subconfigs.append(subconfig)
+
+        targets = []
+        for submodule in self.modules():
+            if not isinstance(submodule, PreTrainedModel) or id(submodule.config) in already_handled:
+                continue
+            already_handled.add(id(submodule.config))
+            if not submodule._can_set_attn_implementation():
+                return
+            try:
+                targets.append((submodule.config, submodule.get_correct_attn_implementation(implementation)))
+            except Exception:
+                # Not usable for this submodel: leave every copy alone rather than write some of them.
+                return
+
+        for config, resolved in targets:
+            config._attn_implementation_internal = resolved
+
     def set_attn_implementation(self, attn_implementation: str | dict, allow_all_kernels: bool = False):
         """
         Set the requested `attn_implementation` for this model.
@@ -1970,6 +2012,10 @@ class PreTrainedModel(
             allow_all_kernels (`bool`, optional):
                 Whether to load kernels from unverified hub repos, if `attn_implementation` is a custom kernel outside
                 of the `kernels-community` hub repository.
+
+        Prefer this over assigning `model.config._attn_implementation` directly: this walks the
+        actual submodules, so it also covers inner stacks built from `copy.deepcopy(config)`,
+        which the config setter cannot reach.
         """
         requested_implementation = (
             attn_implementation

@@ -3541,6 +3541,80 @@ class TestAttentionImplementation(unittest.TestCase):
             expected_logits = model(input_ids).logits
         torch.testing.assert_close(logits, expected_logits, atol=2e-2, rtol=2e-2)
 
+    def test_set_attn_implementation_reaches_copied_stacks(self):
+        """`set_attn_implementation` must reach stacks built with `copy.deepcopy(config)`.
+
+        Those copies are not declared `sub_configs`, and attention reads the implementation from
+        the config of the stack it belongs to, so a model can otherwise keep running the previous
+        backend. Both the model method and a plain assignment on the config must reach them.
+        """
+        from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+        def build(implementation):
+            config = T5Config(
+                vocab_size=99, d_model=16, num_heads=2, num_layers=2, num_decoder_layers=2, d_ff=16, d_kv=8
+            )
+            config._attn_implementation = implementation
+            return T5ForConditionalGeneration(config).eval()
+
+        def sdpa_calls(model):
+            calls = []
+            original = ALL_ATTENTION_FUNCTIONS["sdpa"]
+
+            def spy(*args, **kwargs):
+                calls.append(1)
+                return original(*args, **kwargs)
+
+            ALL_ATTENTION_FUNCTIONS["sdpa"] = spy
+            try:
+                with torch.no_grad():
+                    model(input_ids=torch.tensor([[5, 9, 1]]), decoder_input_ids=torch.tensor([[0, 7]]))
+            finally:
+                ALL_ATTENTION_FUNCTIONS["sdpa"] = original
+            return len(calls)
+
+        reference = sdpa_calls(build("sdpa"))
+        self.assertGreater(reference, 0)
+
+        model = build("eager")
+        model.set_attn_implementation("sdpa")
+        self.assertEqual(model.encoder.config._attn_implementation, "sdpa")
+        self.assertEqual(model.decoder.config._attn_implementation, "sdpa")
+        self.assertEqual(sdpa_calls(model), reference)
+
+        model.set_attn_implementation("eager")
+        self.assertEqual(model.encoder.config._attn_implementation, "eager")
+        self.assertEqual(sdpa_calls(model), 0)
+
+        # Assigning on the config must reach the copies too, not just the top-level config.
+        model = build("eager")
+        model.config._attn_implementation = "sdpa"
+        self.assertEqual(model.config._attn_implementation, "sdpa")
+        self.assertEqual(model.encoder.config._attn_implementation, "sdpa")
+        self.assertEqual(model.decoder.config._attn_implementation, "sdpa")
+        self.assertEqual(sdpa_calls(model), reference)
+
+        model.config._attn_implementation = "eager"
+        self.assertEqual(model.encoder.config._attn_implementation, "eager")
+        self.assertEqual(sdpa_calls(model), 0)
+
+        # A copy of the config inherits the owner set; it must not drive the model it came from.
+        model = build("eager")
+        clone = copy.deepcopy(model.config)
+        clone._attn_implementation = "sdpa"
+        self.assertEqual(model.config._attn_implementation, "eager")
+        self.assertEqual(model.encoder.config._attn_implementation, "eager")
+
+        # Assignment has never raised, and must not start: an unusable value leaves the copies be.
+        model = build("eager")
+        model.config._attn_implementation = "not_a_backend"
+        self.assertEqual(model.encoder.config._attn_implementation, "eager")
+
+        # The back-reference must never reach config.json.
+        self.assertNotIn("_attn_implementation_owners", model.config.to_json_string())
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            model.save_pretrained(tmp_dir)
+
 
 @require_torch
 class TestTensorSharing(TestCasePlus):
